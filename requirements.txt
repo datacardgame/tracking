@@ -1,0 +1,9 @@
+pyautogui>=0.9.54
+pygetwindow>=0.0.9
+opencv-python>=4.10
+numpy>=1.26
+pytesseract>=0.3.13
+pandas>=2.2
+pillow>=10.4
+keyboard>=0.13.5
+requests>=2.32
