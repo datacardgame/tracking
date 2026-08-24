@@ -192,14 +192,37 @@ def _preprocess_for_ocr(img):
     return thresh
 
 
-def ocr_region(region_ltrb, tag="region", return_image=False, psm=None):
+def _save_fixed_debug(img, name):
+    """เซฟภาพ "จุดที่ใช้ตัดสินเรื่องเปลี่ยนหน้า" ทับไฟล์ชื่อเดิมทุกครั้ง (debug_<name>.png)
+    ต่างจาก _debug_save() ที่ต่อท้ายด้วย timestamp แล้วสะสมไฟล์ใหม่ไปเรื่อยๆ - จุดพวกนี้
+    ต้องดูแค่ "ครั้งล่าสุด" เพื่อเช็คว่ากรอบ/จุดที่ตั้งไว้เล็งตรงจริงไหม เก็บย้อนหลังไม่มีประโยชน์
+    รับได้ทั้ง PIL Image และ numpy array (ภาพขาวดำหลัง preprocess)"""
+    if not getattr(cfg, "PAGE_CHECK_DEBUG_IMAGES", True):
+        return
+    path = f"debug_{name}.png"
+    try:
+        if isinstance(img, np.ndarray):
+            cv2.imwrite(path, img)
+        else:
+            img.save(path)
+    except Exception as e:
+        print(f"[warn] เซฟภาพ {path} ไม่สำเร็จ: {e}")
+
+
+def ocr_region(region_ltrb, tag="region", return_image=False, psm=None, fixed_debug_name=None):
     """psm: บังคับโหมดแบ่งหน้าของ Tesseract เป็นตัวเลข เช่น 7 = "บรรทัดเดียว"
     ปล่อยเป็น None เพื่อใช้โหมดอัตโนมัติ (เหมาะกับข้อความหลายบรรทัดอย่างการ์ด/popup)
     ควรใช้ psm=7 กับกรอบเล็กๆ ที่มีข้อความบรรทัดเดียวสั้นๆ เช่นเลขหน้า "1/3"
-    เพราะโหมดอัตโนมัติมักอ่านภาพเล็กขนาดนี้ไม่ออกเลย (ทดสอบแล้ว)"""
+    เพราะโหมดอัตโนมัติมักอ่านภาพเล็กขนาดนี้ไม่ออกเลย (ทดสอบแล้ว)
+
+    fixed_debug_name: ถ้าระบุ จะเซฟภาพดิบเป็น debug_<name>.png และภาพที่ Tesseract
+    เห็นจริง (หลัง threshold + ขยาย) เป็น debug_<name>_ocr.png ทับไฟล์เดิมทุกครั้ง
+    ใช้กับกรอบที่ต้องคอยเช็คว่าเล็งตรงไหม อย่างกรอบเลขหน้า"""
     l, t, r, b = region_ltrb
     img = pyautogui.screenshot(region=(l, t, r - l, b - t))
     _debug_save(img, tag)
+    if fixed_debug_name:
+        _save_fixed_debug(img, fixed_debug_name)
     processed = _preprocess_for_ocr(img)
 
     # กรอบที่เล็กมาก (เช่น PAGE_INDICATOR_REGION แค่ ~65x44 px) ทำให้ Tesseract อ่านเพี้ยน
@@ -213,6 +236,9 @@ def ocr_region(region_ltrb, tag="region", return_image=False, psm=None):
     if min(h, w) < MIN_DIM:
         scale = max(2, -(-MIN_DIM // min(h, w)))  # ceil(MIN_DIM / min(h, w))
         processed = cv2.resize(processed, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+
+    if fixed_debug_name:
+        _save_fixed_debug(processed, f"{fixed_debug_name}_ocr")
 
     config = f"--psm {psm}" if psm is not None else ""
     text = pytesseract.image_to_string(processed, lang=cfg.OCR_LANGUAGES, config=config).strip()
@@ -647,12 +673,99 @@ def item_key(item):
     return f"{skill_titles}|{price}"
 
 
-def page_is_last(text):
-    m = PAGE_NUM_RE.search(text)
-    if not m:
-        return True  # อ่านเลขหน้าไม่ออก หยุดไว้ก่อนเพื่อความปลอดภัย
-    current, total = int(m.group(1)), int(m.group(2))
-    return current >= total
+# ---------------------------------------------------------------
+# ตรวจว่า "ยังมีหน้าถัดไปอีกไหม" (3 ชั้น - ดูหัวข้อ 5.1 ใน market_config.py)
+# ---------------------------------------------------------------
+
+def _grid_region():
+    """กรอบรวมของลิสต์การ์ดทั้งหน้า คำนวณจากการ์ดใบแรก + ระยะห่าง (ไม่ต้องคาลิเบรตเพิ่ม)
+    ใช้แคปภาพมาเทียบก่อน/หลังกดปุ่มเปลี่ยนหน้า ว่าหน้าเปลี่ยนจริงหรือกดแล้วไม่มีอะไรเกิดขึ้น"""
+    l, t, r, b = cfg.FIRST_CARD_TEXT_REGION
+    return (
+        l, t,
+        r + (cfg.GRID_COLS - 1) * cfg.CARD_PITCH_X,
+        b + (cfg.GRID_ROWS - 1) * cfg.CARD_PITCH_Y,
+    )
+
+
+def _page_signature():
+    """ย่อภาพลิสต์ทั้งหน้าเหลือ 96x96 ขาวดำ ไว้เทียบว่าหน้าเปลี่ยนไปไหม (ย่อก่อนเพื่อให้
+    ทนต่อความต่างเล็กๆ น้อยๆ อย่างตัวจับเวลาที่เดินตลอดเวลา และเร็วกว่าเทียบภาพเต็ม)"""
+    l, t, r, b = _grid_region()
+    img = pyautogui.screenshot(region=(l, t, r - l, b - t))
+    gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+    return cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA).astype(np.int16)
+
+
+def _signature_diff_ratio(a, b):
+    """สัดส่วนพิกเซล (0.0-1.0) ที่ต่างกันเกิน 25 ระดับสีระหว่างสองภาพย่อ"""
+    if a is None or b is None:
+        return 1.0
+    return float((np.abs(a - b) > 25).mean())
+
+
+def _arrow_brightness(pos, debug_name=None):
+    """วัดความสว่างเฉลี่ย (0-255) ของกรอบสี่เหลี่ยมรอบจุด pos - ใช้แยก "ปุ่มลูกศรที่กดได้"
+    (สว่าง/มีสี) ออกจาก "ปุ่มที่กดไม่ได้แล้ว" (จาง/เทา) คืน None ถ้าแคปภาพไม่ได้"""
+    rad = getattr(cfg, "NEXT_PAGE_CHECK_RADIUS", 16)
+    x, y = pos
+    left, top = max(x - rad, 0), max(y - rad, 0)
+    try:
+        img = pyautogui.screenshot(region=(left, top, rad * 2, rad * 2))
+    except Exception as e:
+        print(f"[warn] แคปภาพปุ่มลูกศรที่ {pos} ไม่สำเร็จ: {e}")
+        return None
+    if debug_name:
+        _save_fixed_debug(img, debug_name)
+    return float(np.array(img.convert("RGB")).max(axis=2).mean())
+
+
+def check_next_page():
+    """ตัดสินว่า "ยังมีหน้าถัดไปอีกไหม" คืน (has_next, reason)
+
+    ไล่ตัดสิน 3 ชั้นจากน่าเชื่อถือมากไปน้อย (รายละเอียดเต็มอยู่ในหัวข้อ 5.1 ของ
+    market_config.py):
+      1. OCR เลขหน้า "n/m" - ถ้าอ่านออกใช้เลย แม่นที่สุด
+      2. ความสว่างของปุ่มลูกศรขวา - ใช้เมื่อตั้ง NEXT_PAGE_ENABLED_MIN_BRIGHTNESS ไว้แล้ว
+      3. ตอบ True ไว้ก่อน แล้วให้ scan_market() กดเปลี่ยนหน้าจริงแล้วเทียบภาพเอา
+
+    จุดสำคัญที่ต่างจากโค้ดเดิม (page_is_last): เดิมถ้า OCR อ่านเลขหน้าไม่ออกจะถือว่า
+    "หน้าสุดท้าย" แล้วหยุดทันที ซึ่งเป็นสาเหตุที่สแกนจบแค่หน้า 1 ทุกครั้ง (กรอบเลขหน้า
+    เล็กแค่ ~65x44 px OCR อ่านพลาดบ่อยมาก) ตอนนี้อ่านไม่ออกจะไม่หยุดเอง แต่ไปพึ่ง
+    ชั้น 2/3 แทน ซึ่งยังกันลูปไม่รู้จบได้เพราะชั้น 3 หยุดเมื่อกดแล้วหน้าไม่เปลี่ยน
+    (และยังมี MAX_PAGES คุมอีกชั้น)"""
+    page_text = ocr_region(
+        cfg.PAGE_INDICATOR_REGION, tag="page_indicator", psm=7,
+        fixed_debug_name="page_indicator",
+    )
+
+    # ชั้น 1: OCR เลขหน้า
+    m = PAGE_NUM_RE.search(page_text)
+    if m:
+        current, total = int(m.group(1)), int(m.group(2))
+        # กันค่าเพี้ยนแบบ "0/8", "3/1", "1/99" ที่มาจาก OCR อ่านผิด - ถ้าไม่สมเหตุสมผล
+        # ให้ตกไปใช้ชั้นถัดไปแทนที่จะเชื่อตัวเลขมั่วๆ
+        if 1 <= current <= total <= cfg.MAX_PAGES:
+            return current < total, f"อ่านเลขหน้าได้ '{page_text}' -> หน้า {current}/{total}"
+
+    # ชั้น 2: ความสว่างของปุ่มลูกศร
+    next_pos = getattr(cfg, "NEXT_PAGE_CHECK_POS", None) or cfg.NEXT_PAGE_POS
+    next_bright = _arrow_brightness(next_pos, debug_name="next_page_check")
+
+    prev_pos = getattr(cfg, "PREV_PAGE_CHECK_POS", None)
+    prev_bright = _arrow_brightness(prev_pos, debug_name="prev_page_check") if prev_pos else None
+
+    measured = f"ลูกศรขวา {next_bright:.1f}" if next_bright is not None else "ลูกศรขวา วัดไม่ได้"
+    if prev_bright is not None:
+        measured += f" / ลูกศรซ้าย {prev_bright:.1f}"
+    print(f"[page] OCR เลขหน้าอ่านไม่ออก (ได้ '{page_text}') - วัดความสว่างปุ่มแทน: {measured}")
+
+    threshold = getattr(cfg, "NEXT_PAGE_ENABLED_MIN_BRIGHTNESS", None)
+    if threshold is not None and next_bright is not None:
+        return next_bright >= threshold, f"{measured} (เกณฑ์ปุ่มกดได้ >= {threshold})"
+
+    # ชั้น 3: ตัดสินไม่ได้ -> ลองกดดูก่อน แล้วให้ผู้เรียกเทียบภาพเอาว่าเปลี่ยนจริงไหม
+    return True, f"{measured} (ยังไม่ตั้ง NEXT_PAGE_ENABLED_MIN_BRIGHTNESS - จะลองกดแล้วเทียบภาพแทน)"
 
 
 # ---------------------------------------------------------------
@@ -802,13 +915,32 @@ def scan_market():
                     items.append(item)
 
         page += 1
-        if cfg.SCAN_ONLY_FIRST_PAGE or page >= cfg.MAX_PAGES:
+        if cfg.SCAN_ONLY_FIRST_PAGE:
+            break
+        if page >= cfg.MAX_PAGES:
+            print(f"[page] ถึงขีดจำกัด MAX_PAGES ({cfg.MAX_PAGES} หน้า) แล้ว หยุดสแกน")
             break
 
-        page_text = ocr_region(cfg.PAGE_INDICATOR_REGION, tag="page_indicator", psm=7)
-        if page_is_last(page_text):
+        has_next, reason = check_next_page()
+        if not has_next:
+            print(f"[page] จบหน้า {page} - หน้าสุดท้ายแล้ว ({reason})")
             break
+        print(f"[page] จบหน้า {page} - ไปหน้าถัดไป ({reason})")
+
+        # กดเปลี่ยนหน้าแล้วยืนยันด้วยภาพว่า "เปลี่ยนจริง" - จำเป็นเพราะชั้น 3 ของ
+        # check_next_page() ตอบ True ไว้ก่อนเมื่อตัดสินไม่ได้ ถ้ากดแล้วลิสต์เหมือนเดิม
+        # เป๊ะแปลว่าอยู่หน้าสุดท้ายจริง (ปุ่มกดไม่ติด) ต้องหยุด ไม่งั้นจะวนสแกนหน้าเดิมซ้ำ
+        # จนครบ MAX_PAGES เปลืองเวลาไปเปล่าๆ
+        before_sig = _page_signature()
         go_to_next_page()
+        after_sig = _page_signature()
+        diff_ratio = _signature_diff_ratio(before_sig, after_sig)
+        min_diff = getattr(cfg, "PAGE_CHANGE_MIN_DIFF_RATIO", 0.10)
+        if diff_ratio < min_diff:
+            print(f"[page] กดปุ่มหน้าถัดไปแล้วแต่ลิสต์แทบไม่เปลี่ยน "
+                  f"(ต่างกัน {diff_ratio:.1%} < เกณฑ์ {min_diff:.0%}) - ถือว่าอยู่หน้าสุดท้ายแล้ว หยุดสแกน")
+            break
+        print(f"[page] เปลี่ยนไปหน้า {page + 1} สำเร็จ (ลิสต์ต่างจากหน้าก่อน {diff_ratio:.1%})")
         pages_advanced += 1
 
     if not cfg.SCAN_ONLY_FIRST_PAGE:
@@ -1234,6 +1366,63 @@ def run_once():
     print("บันทึกไฟล์เสร็จสมบูรณ์แล้ว - ปลอดภัยที่จะกด Ctrl+C หยุดสคริปต์ตอนนี้ได้ (ถ้าต้องการ)")
 
 
+def check_page_mode():
+    """โหมดคาลิเบรตจุดตรวจหน้าถัดไป: python market_tracker.py checkpage
+
+    ไม่สแกน ไม่คลิกอะไรทั้งนั้น แค่แคปภาพจุดที่ใช้ตัดสินแล้วรายงานค่าที่วัดได้ + เซฟภาพ
+    ทับไฟล์ชื่อเดิม เอาไว้เทียบค่าระหว่าง "อยู่หน้า 1" กับ "อยู่หน้าสุดท้าย" เพื่อหาเกณฑ์
+    NEXT_PAGE_ENABLED_MIN_BRIGHTNESS ที่เหมาะกับเกม/จอของเครื่องนี้"""
+    print("=== ตรวจจุดที่ใช้ตัดสิน 'มีหน้าถัดไปไหม' ===")
+    print("เปิดหน้า Trade House ค้างไว้ให้เห็นแถบเปลี่ยนหน้าด้านล่าง แล้วรอ 3 วินาที...\n")
+    time.sleep(3)
+
+    page_text = ocr_region(
+        cfg.PAGE_INDICATOR_REGION, tag="page_indicator", psm=7,
+        fixed_debug_name="page_indicator",
+    )
+    m = PAGE_NUM_RE.search(page_text)
+    print(f"กรอบเลขหน้า PAGE_INDICATOR_REGION = {cfg.PAGE_INDICATOR_REGION}")
+    print(f"  OCR อ่านได้: {page_text!r}")
+    if m:
+        print(f"  -> แยกเป็นหน้า {m.group(1)}/{m.group(2)} (ใช้ได้ ชั้น 1 ทำงานปกติ)")
+    else:
+        print("  -> แยกเลขหน้าไม่ได้ ให้เปิด debug_page_indicator.png เช็คว่ากรอบครอบตรงเลขไหม")
+        print("     และ debug_page_indicator_ocr.png (สิ่งที่ Tesseract เห็นจริง) ว่าตาคนยังอ่านออกไหม")
+
+    next_pos = getattr(cfg, "NEXT_PAGE_CHECK_POS", None) or cfg.NEXT_PAGE_POS
+    prev_pos = getattr(cfg, "PREV_PAGE_CHECK_POS", None)
+    rad = getattr(cfg, "NEXT_PAGE_CHECK_RADIUS", 16)
+    next_bright = _arrow_brightness(next_pos, debug_name="next_page_check")
+    prev_bright = _arrow_brightness(prev_pos, debug_name="prev_page_check") if prev_pos else None
+
+    print(f"\nปุ่มลูกศรขวา NEXT_PAGE_CHECK_POS = {next_pos} (กรอบ {rad * 2}x{rad * 2} px)")
+    print(f"  ความสว่างเฉลี่ย: {next_bright:.1f}" if next_bright is not None else "  วัดไม่ได้")
+    if prev_bright is not None:
+        print(f"ปุ่มลูกศรซ้าย PREV_PAGE_CHECK_POS = {prev_pos}")
+        print(f"  ความสว่างเฉลี่ย: {prev_bright:.1f}")
+        gap = abs(next_bright - prev_bright) if next_bright is not None else 0
+        print(f"  ต่างกัน: {gap:.1f}")
+        if gap < 15:
+            print("  -> ต่างกันน้อยมาก เกมนี้อาจไม่ได้ทำปุ่มที่กดไม่ได้ให้จางลง")
+            print("     ปล่อย NEXT_PAGE_ENABLED_MIN_BRIGHTNESS = None ไว้ได้เลย (ชั้น 3 รับมือแทน)")
+        else:
+            print(f"  -> ต่างกันชัดเจน ลองตั้ง NEXT_PAGE_ENABLED_MIN_BRIGHTNESS "
+                  f"= {(next_bright + prev_bright) / 2:.0f} (ค่ากึ่งกลาง)")
+
+    threshold = getattr(cfg, "NEXT_PAGE_ENABLED_MIN_BRIGHTNESS", None)
+    print(f"\nเกณฑ์ที่ตั้งไว้ตอนนี้: NEXT_PAGE_ENABLED_MIN_BRIGHTNESS = {threshold}")
+    has_next, reason = check_next_page()
+    print(f"สรุปตอนนี้: {'ยังมีหน้าถัดไป' if has_next else 'หน้าสุดท้ายแล้ว'} ({reason})")
+
+    print("\nภาพที่เซฟไว้ (ทับไฟล์เดิมทุกครั้งที่รัน):")
+    for name in ("debug_page_indicator.png", "debug_page_indicator_ocr.png",
+                 "debug_next_page_check.png", "debug_prev_page_check.png"):
+        if os.path.exists(name):
+            print(f"  {os.path.abspath(name)}")
+    print("\nวิธีคาลิเบรต: รันคำสั่งนี้ตอนอยู่ 'หน้า 1' หนึ่งครั้ง แล้วกดไปหน้าสุดท้ายด้วยมือ")
+    print("รันอีกครั้ง เอาค่าความสว่างลูกศรขวาสองครั้งมาเทียบกัน แล้วตั้งเกณฑ์ไว้ตรงกลาง")
+
+
 def main():
     print("เริ่ม market tracker - กด Ctrl+C เพื่อหยุด")
     print(f"จะสแกนทุก {cfg.POLL_INTERVAL_SEC // 60} นาที\n")
@@ -1253,7 +1442,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if len(sys.argv) > 1 and sys.argv[1] == "checkpage":
+            check_page_mode()
+        else:
+            main()
     except SystemExit:
         raise
     except Exception:
