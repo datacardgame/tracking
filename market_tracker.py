@@ -66,7 +66,34 @@ def _load_config():
 
 cfg = _load_config()
 
-pytesseract.pytesseract.tesseract_cmd = cfg.TESSERACT_CMD
+
+def _resolve_tesseract_cmd():
+    """หา tesseract.exe ให้เจอ - ใช้ค่าใน cfg.TESSERACT_CMD ก่อนเสมอ ถ้าไฟล์ตรงนั้นไม่มีจริง
+    ค่อยไล่หาตามที่ติดตั้งกันบ่อยๆ (ทั้งไดรฟ์ C: และ D:) และใน PATH
+
+    เหตุผล: เครื่องคนละเครื่องติดตั้งคนละไดรฟ์ (เจอจริง - เครื่องหนึ่งอยู่ C:\\Program Files
+    อีกเครื่องอยู่ D:\\Program Files) ถ้าฮาร์ดโค้ดไว้ค่าเดียว ย้ายเครื่องทีต้องแก้ config ทุกที
+    และถ้าลืมแก้จะไปพังตอน OCR ครั้งแรกด้วย error ที่อ่านไม่รู้เรื่องว่าเกิดจากอะไร"""
+    import shutil
+    candidates = [getattr(cfg, "TESSERACT_CMD", None)]
+    for drive in ("C:", "D:", "E:"):
+        candidates.append(rf"{drive}\Program Files\Tesseract-OCR\tesseract.exe")
+        candidates.append(rf"{drive}\Program Files (x86)\Tesseract-OCR\tesseract.exe")
+    candidates.append(shutil.which("tesseract"))
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            if path != getattr(cfg, "TESSERACT_CMD", None):
+                print(f"[ocr] ไม่พบ tesseract ตามที่ตั้งไว้ใน TESSERACT_CMD "
+                      f"({getattr(cfg, 'TESSERACT_CMD', '-')}) - ใช้ที่เจอแทน: {path}")
+            return path
+
+    print("[ocr] หา tesseract.exe ไม่เจอเลยสักที่ - OCR จะพังทั้งหมด")
+    print("      ติดตั้ง Tesseract OCR ก่อน (ดู README.md) แล้วใส่ path จริงใน TESSERACT_CMD")
+    return getattr(cfg, "TESSERACT_CMD", "tesseract")
+
+
+pytesseract.pytesseract.tesseract_cmd = _resolve_tesseract_cmd()
 
 
 # บรรทัด "ชื่อสกิล LV.n" เท่านั้น (ไม่ใช่ประโยคคำอธิบายที่บังเอิญมีคำว่า Lv. อยู่กลางประโยค)
@@ -209,8 +236,10 @@ def _save_fixed_debug(img, name):
         print(f"[warn] เซฟภาพ {path} ไม่สำเร็จ: {e}")
 
 
-def ocr_region(region_ltrb, tag="region", return_image=False, psm=None, fixed_debug_name=None):
+def ocr_region(region_ltrb, tag="region", return_image=False, psm=None, fixed_debug_name=None,
+               accept=None):
     """psm: บังคับโหมดแบ่งหน้าของ Tesseract เป็นตัวเลข เช่น 7 = "บรรทัดเดียว"
+    ใส่เป็นลิสต์ได้ เช่น (13, 8, 7) = ไล่ลองทีละโหมดจนกว่า accept(text) จะคืน True
     ปล่อยเป็น None เพื่อใช้โหมดอัตโนมัติ (เหมาะกับข้อความหลายบรรทัดอย่างการ์ด/popup)
     ควรใช้ psm=7 กับกรอบเล็กๆ ที่มีข้อความบรรทัดเดียวสั้นๆ เช่นเลขหน้า "1/3"
     เพราะโหมดอัตโนมัติมักอ่านภาพเล็กขนาดนี้ไม่ออกเลย (ทดสอบแล้ว)
@@ -240,8 +269,18 @@ def ocr_region(region_ltrb, tag="region", return_image=False, psm=None, fixed_de
     if fixed_debug_name:
         _save_fixed_debug(processed, f"{fixed_debug_name}_ocr")
 
-    config = f"--psm {psm}" if psm is not None else ""
-    text = pytesseract.image_to_string(processed, lang=cfg.OCR_LANGUAGES, config=config).strip()
+    # psm รับได้ทั้งตัวเลขเดียวและลิสต์ - ถ้าเป็นลิสต์จะไล่ลองทีละโหมดจนกว่า accept()
+    # จะผ่าน (ใช้กับกรอบที่รู้ล่วงหน้าว่าผลลัพธ์ต้องหน้าตายังไง อย่างเลขหน้าที่ต้องเป็น "n/m")
+    # เหตุผล: วัดกับภาพเลขหน้าจริงแล้ว psm 7 อ่าน "1/14" เป็น 'WAY:' แต่ psm 13 กับ 8
+    # อ่านถูกทั้งคู่ - โหมดที่เหมาะกับกรอบเล็กๆ ไม่ได้มีโหมดเดียวที่ใช้ได้ทุกภาพ ลองหลายโหมด
+    # แล้วเอาอันที่ให้ผลสมเหตุสมผลจึงเสถียรกว่าล็อกโหมดเดียวไว้ตายตัว
+    psm_list = list(psm) if isinstance(psm, (list, tuple)) else [psm]
+    text = ""
+    for p in psm_list:
+        config = f"--psm {p}" if p is not None else ""
+        text = pytesseract.image_to_string(processed, lang=cfg.OCR_LANGUAGES, config=config).strip()
+        if accept is None or accept(text):
+            break
     if return_image:
         return text, img
     return text
@@ -698,10 +737,52 @@ def _page_signature():
 
 
 def _signature_diff_ratio(a, b):
-    """สัดส่วนพิกเซล (0.0-1.0) ที่ต่างกันเกิน 25 ระดับสีระหว่างสองภาพย่อ"""
+    """สัดส่วนพิกเซล (0.0-1.0) ที่ต่างกันเกิน 25 ระดับสีระหว่างสองภาพย่อ
+
+    ใช้ได้เฉพาะกับการเช็ค "หน้าวาดเสร็จหรือยัง" (ตอนกำลังวาด การ์ดยังไม่ขึ้น พื้นที่ใหญ่ๆ
+    เปลี่ยนทั้งบล็อก ค่าจะสูงชัดเจน) ห้ามเอาไปใช้ตัดสินว่า "เปลี่ยนไปหน้าใหม่แล้วหรือยัง"
+    เพราะทุกหน้าหน้าตาเหมือนกันหมด (การ์ดขาว 8 ใบตำแหน่งเดิม พื้นหลังเดิม) ต่างกันแค่
+    เส้นตัวหนังสือบางๆ ข้างใน - วัดจากภาพจำลองแล้วสองหน้าที่ไอเท็มคนละชุดกันเลยต่างกัน
+    แค่ ~0.9% ของพิกเซล ใกล้ระดับ noise เกินกว่าจะตั้งเกณฑ์ได้อย่างมั่นใจ
+    (การตัดสินเปลี่ยนหน้าย้ายไปใช้ _pages_look_identical() ที่เทียบคีย์ไอเท็มแทน)"""
     if a is None or b is None:
         return 1.0
     return float((np.abs(a - b) > 25).mean())
+
+
+def _wait_for_page_render():
+    """รอจนภาพลิสต์ "นิ่ง" หลังกดเปลี่ยนหน้า แทนการ sleep ค่าคงที่อย่างเดียว - เกมใช้เวลา
+    วาดการ์ดหน้าใหม่ไม่เท่ากันทุกครั้ง (ขึ้นกับโหลดไอคอน/สภาพเน็ต) ถ้าเริ่มแคปเร็วเกินไป
+    จะได้ภาพหน้าเก่าหรือหน้าที่วาดไม่เสร็จ ทำให้ OCR อ่านการ์ดไม่ออกทั้งหน้า
+    คืนจำนวนวินาทีที่รอไปจริง"""
+    max_wait = getattr(cfg, "PAGE_RENDER_MAX_WAIT_SEC", 3.0)
+    stable_diff = getattr(cfg, "PAGE_RENDER_STABLE_MAX_DIFF", 0.005)
+    interval = 0.25
+    prev = _page_signature()
+    waited = 0.0
+    while waited < max_wait:
+        time.sleep(interval)
+        waited += interval
+        cur = _page_signature()
+        if _signature_diff_ratio(prev, cur) <= stable_diff:
+            return waited
+        prev = cur
+    print(f"[page] รอหน้าใหม่วาดเสร็จครบ {max_wait} วินาทีแล้วภาพยังไม่นิ่ง - สแกนต่อไปเลย")
+    return waited
+
+
+def _pages_look_identical(keys_a, keys_b):
+    """เทียบว่า "สองหน้านี้คือหน้าเดียวกัน" ไหม โดยดูจากคีย์ไอเท็ม (ชื่อสกิล+ราคา) ที่ OCR
+    อ่านได้ ไม่ใช่เทียบพิกเซล - ใช้เป็นตัวยืนยันขั้นสุดท้ายว่าปุ่มเปลี่ยนหน้ากดติดจริงไหม
+    ถ้าสแกนหน้าใหม่มาแล้วได้ไอเท็มชุดเดิมเป๊ะ แปลว่าปุ่มกดไม่ติด (อยู่หน้าสุดท้ายแล้ว)
+
+    ยอมให้เหลื่อมกันได้บ้าง (ไม่ต้องตรงกัน 100%) เพราะ OCR อ่านหน้าเดียวกันสองรอบอาจได้
+    คีย์ไม่ตรงกันเป๊ะทุกใบ - ใช้สัดส่วนคีย์ที่ซ้ำกันเทียบกับหน้าที่มีไอเท็มเยอะกว่า"""
+    if not keys_a or not keys_b:
+        return False
+    min_overlap = getattr(cfg, "PAGE_DUPLICATE_MIN_OVERLAP", 0.7)
+    a, b = set(keys_a), set(keys_b)
+    return len(a & b) / max(len(a), len(b)) >= min_overlap
 
 
 def _arrow_brightness(pos, debug_name=None):
@@ -735,7 +816,9 @@ def check_next_page():
     ชั้น 2/3 แทน ซึ่งยังกันลูปไม่รู้จบได้เพราะชั้น 3 หยุดเมื่อกดแล้วหน้าไม่เปลี่ยน
     (และยังมี MAX_PAGES คุมอีกชั้น)"""
     page_text = ocr_region(
-        cfg.PAGE_INDICATOR_REGION, tag="page_indicator", psm=7,
+        cfg.PAGE_INDICATOR_REGION, tag="page_indicator",
+        psm=getattr(cfg, "PAGE_INDICATOR_PSM_CANDIDATES", (13, 8, 7)),
+        accept=lambda t: PAGE_NUM_RE.search(t) is not None,
         fixed_debug_name="page_indicator",
     )
 
@@ -764,8 +847,9 @@ def check_next_page():
     if threshold is not None and next_bright is not None:
         return next_bright >= threshold, f"{measured} (เกณฑ์ปุ่มกดได้ >= {threshold})"
 
-    # ชั้น 3: ตัดสินไม่ได้ -> ลองกดดูก่อน แล้วให้ผู้เรียกเทียบภาพเอาว่าเปลี่ยนจริงไหม
-    return True, f"{measured} (ยังไม่ตั้ง NEXT_PAGE_ENABLED_MIN_BRIGHTNESS - จะลองกดแล้วเทียบภาพแทน)"
+    # ชั้น 3: ตัดสินไม่ได้ -> ตอบว่า "ไปต่อ" ไว้ก่อน แล้วให้ scan_market() ยืนยันทีหลังจาก
+    # คีย์ไอเท็มที่สแกนได้ (ถ้าหน้าใหม่ได้ของชุดเดิม แปลว่ากดไม่ติด ค่อยหยุดตอนนั้น)
+    return True, f"{measured} (ยังไม่ตั้ง NEXT_PAGE_ENABLED_MIN_BRIGHTNESS - จะกดไปก่อนแล้วดูจากไอเท็มที่สแกนได้)"
 
 
 # ---------------------------------------------------------------
@@ -907,14 +991,35 @@ def scan_market():
     items = []
     page = 0
     pages_advanced = 0
+    prev_page_keys = None
+
     while True:
+        page_items = []
         for row in range(cfg.GRID_ROWS):
             for col in range(cfg.GRID_COLS):
                 item = scan_one_card(row, col)
                 if item:
-                    items.append(item)
+                    page_items.append(item)
+        page_keys = [it["key"] for it in page_items]
 
+        # ยืนยันว่าปุ่มเปลี่ยนหน้า "กดติดจริง" โดยดูจากของที่สแกนได้ ไม่ใช่เทียบพิกเซล
+        # (ทุกหน้าหน้าตาเหมือนกันหมด - การ์ดขาว 8 ใบตำแหน่งเดิม พื้นหลังเดิม - เทียบพิกเซล
+        # แยกไม่ออก ดูคอมเมนต์ใน _signature_diff_ratio) และเช็ค "หลัง" สแกนเสร็จ ไม่ใช่ก่อน
+        # จึงไม่มีทางหยุดก่อนเวลาเหมือนบั๊กเดิม อย่างแย่สุดคือเสียเวลาสแกนหน้าสุดท้ายซ้ำ
+        # หนึ่งรอบแล้วทิ้งผลไป (เกิดเฉพาะตอน OCR อ่านเลขหน้าไม่ออกเท่านั้น)
+        if page > 0 and not page_items:
+            print(f"[page] หน้า {page + 1} ไม่มีไอเท็มเลย - เลยหน้าสุดท้ายมาแล้ว หยุดสแกน")
+            break
+        if _pages_look_identical(page_keys, prev_page_keys):
+            print(f"[page] หน้า {page + 1} ได้ไอเท็มชุดเดิมกับหน้าก่อน - แปลว่ากดปุ่มเปลี่ยนหน้าไม่ติด "
+                  f"(อยู่หน้าสุดท้ายแล้ว) ทิ้งผลหน้านี้แล้วหยุดสแกน")
+            break
+
+        items.extend(page_items)
+        prev_page_keys = page_keys
         page += 1
+        print(f"[page] สแกนหน้า {page} เสร็จ - เจอ {len(page_items)} ไอเท็ม (สะสมทั้งหมด {len(items)})")
+
         if cfg.SCAN_ONLY_FIRST_PAGE:
             break
         if page >= cfg.MAX_PAGES:
@@ -923,24 +1028,13 @@ def scan_market():
 
         has_next, reason = check_next_page()
         if not has_next:
-            print(f"[page] จบหน้า {page} - หน้าสุดท้ายแล้ว ({reason})")
+            print(f"[page] หน้าสุดท้ายแล้ว ({reason})")
             break
-        print(f"[page] จบหน้า {page} - ไปหน้าถัดไป ({reason})")
 
-        # กดเปลี่ยนหน้าแล้วยืนยันด้วยภาพว่า "เปลี่ยนจริง" - จำเป็นเพราะชั้น 3 ของ
-        # check_next_page() ตอบ True ไว้ก่อนเมื่อตัดสินไม่ได้ ถ้ากดแล้วลิสต์เหมือนเดิม
-        # เป๊ะแปลว่าอยู่หน้าสุดท้ายจริง (ปุ่มกดไม่ติด) ต้องหยุด ไม่งั้นจะวนสแกนหน้าเดิมซ้ำ
-        # จนครบ MAX_PAGES เปลืองเวลาไปเปล่าๆ
-        before_sig = _page_signature()
+        print(f"[page] ไปหน้าถัดไป ({reason})")
         go_to_next_page()
-        after_sig = _page_signature()
-        diff_ratio = _signature_diff_ratio(before_sig, after_sig)
-        min_diff = getattr(cfg, "PAGE_CHANGE_MIN_DIFF_RATIO", 0.10)
-        if diff_ratio < min_diff:
-            print(f"[page] กดปุ่มหน้าถัดไปแล้วแต่ลิสต์แทบไม่เปลี่ยน "
-                  f"(ต่างกัน {diff_ratio:.1%} < เกณฑ์ {min_diff:.0%}) - ถือว่าอยู่หน้าสุดท้ายแล้ว หยุดสแกน")
-            break
-        print(f"[page] เปลี่ยนไปหน้า {page + 1} สำเร็จ (ลิสต์ต่างจากหน้าก่อน {diff_ratio:.1%})")
+        waited = _wait_for_page_render()
+        print(f"[page] รอหน้าใหม่วาดเสร็จ {waited:.2f} วินาที - เริ่มสแกนหน้า {page + 1}")
         pages_advanced += 1
 
     if not cfg.SCAN_ONLY_FIRST_PAGE:
@@ -1377,7 +1471,9 @@ def check_page_mode():
     time.sleep(3)
 
     page_text = ocr_region(
-        cfg.PAGE_INDICATOR_REGION, tag="page_indicator", psm=7,
+        cfg.PAGE_INDICATOR_REGION, tag="page_indicator",
+        psm=getattr(cfg, "PAGE_INDICATOR_PSM_CANDIDATES", (13, 8, 7)),
+        accept=lambda t: PAGE_NUM_RE.search(t) is not None,
         fixed_debug_name="page_indicator",
     )
     m = PAGE_NUM_RE.search(page_text)
